@@ -1,0 +1,402 @@
+// scanbadblocks - check USB drives, SSDs and other disks by reading and optionally writing all blocks
+//
+// Copyright (c) 2025 Johannes Overmann
+//
+// Distributed under the Boost Software License, Version 1.0.
+// (See accompanying file LICENSE_1_0.txt or copy at https://www.boost.org/LICENSE_1_0.txt)
+
+#include <iostream>
+#include <filesystem>
+#include <utility>
+#include <functional>
+#include <numeric>
+#include <ranges>
+#include <format>
+#include <fcntl.h>      // open()
+#include <unistd.h>     // read(), write(), close()
+#include "CommandLineParser.hpp"
+#include "MiscUtils.hpp"
+#include "UnitTest.hpp"
+
+static uint64_t verbose = 0; // --verbose
+
+const double MB = 1024.0 * 1024.0;
+const double GB = 1024.0 * 1024.0 * 1024.0;
+
+class BlockChecker
+{
+public:
+    BlockChecker(const std::string& filename_, const std::string& blockSizeStr, const std::string& patternStr, const std::string& outfile_)
+    {
+        filename = filename_;
+        outfile = outfile_;
+        blockSize = ut1::strToU64(blockSizeStr);
+        patterns = ut1::csvIntegersToVector<uint8_t>(patternStr, 16);
+        sizeBytes = ut1::getFileSize(filename);
+        numBlocks = (sizeBytes + blockSize - 1) / blockSize;
+        blockStats.resize(numBlocks);
+        std::cout << std::format("{}: Size={:.1f} GB ({}, numBlocks={}, blockSize={}, size is a multiple of {})\n",
+            filename_, sizeBytes / GB, ut1::getPreciseSizeStr(sizeBytes), numBlocks,
+            ut1::getPreciseSizeStr(blockSize), ut1::getPreciseSizeStr(ut1::getLargestPowerOfTwoFactor(sizeBytes)));
+        if (sizeBytes == 0)
+        {
+            throw std::runtime_error("Cannot determine size!");
+        }
+    }
+
+    void checkReadOnly()
+    {
+        numPasses = 1;
+        readPassesRemaining = 1;
+        writePassesRemaining = 0;
+        readPass();
+    }
+
+    void checkWriteRead()
+    {
+        numPasses = patterns.size() * 2;
+        readPassesRemaining = numPasses / 2;
+        writePassesRemaining = numPasses / 2;
+        for (size_t i = 0; i < patterns.size(); i++)
+        {
+            writePass(patterns[i]);
+            readPass(patterns[i]);
+        }
+    }
+
+    void printResult()
+    {
+        std::cout << std::format("Transfer rates: read={:.1f}MB/s write={:.1f}MB/s\n", getReadBytesPerSecond() / MB, getWriteBytesPerSecond() / MB);
+        if (totalRead.errors + totalWrite.errors > 0)
+        {
+            std::cout << std::format("ERROR: {} errors detected ({} read errors, {} write errors)\n", totalRead.errors + totalWrite.errors, totalRead.errors, totalWrite.errors);
+        }
+        else
+        {
+            std::cout << "OK: No errors detected.\n";
+        }
+    }
+
+private:
+
+    void readPass(std::optional<uint8_t> pattern = std::nullopt)
+    {
+        readPassesRemaining--;
+        blockStats.clear();
+        blockStats.resize(numBlocks);
+        lastProgressTime = ut1::getTimeSec();
+
+        int fd = ::open(filename.c_str(), O_RDONLY);
+        if (fd < 0)
+        {
+            throw std::runtime_error(std::format("Error opening file '{}' for reading ({})", filename, strerror(errno)));
+        }
+
+        std::vector<uint8_t> buffer(blockSize);
+        std::vector<uint8_t> expected(blockSize, *pattern);
+
+        for (size_t blockIndex = 0; blockIndex < numBlocks; blockIndex++)
+        {
+            initBlock(expected, blockIndex, *pattern);
+            size_t accessSize = blockSize;
+            if ((blockIndex + 1) * blockSize > sizeBytes)
+            {
+                accessSize = sizeBytes % blockSize;
+            }
+            double startTime = ut1::getTimeSec();
+            ssize_t result = ::read(fd, buffer.data(), accessSize);
+            double elapsed = ut1::getTimeSec() - startTime;
+            if (result < 0)
+            {
+                blockStats[blockIndex].errors++;
+                totalRead.errors++;
+            }
+            else
+            {
+                if (pattern)
+                {
+                    for (size_t i = 0; i < blockSize; i++)
+                    {
+                        if (buffer[i] != expected[i])
+                        {
+                            std::cout << std::format("Data error: Expected {:#04x} and got {:#04x} (block {}).\n", expected[i], buffer[i], blockIndex);
+                            blockStats[blockIndex].errors++;
+                            totalRead.errors++;
+                            break;
+                        }
+                    }
+                }
+                blockStats[blockIndex].time += elapsed;
+                blockStats[blockIndex].bytes += accessSize;
+                totalRead.time += elapsed;
+                totalRead.bytes += accessSize;
+            }
+            printProgress(blockIndex);
+        }
+
+        close(fd);
+        printPassStats(/*read=*/true);
+        passIndex++;
+    }
+
+    void writePass(uint8_t pattern)
+    {
+        writePassesRemaining--;
+        blockStats.clear();
+        blockStats.resize(numBlocks);
+        lastProgressTime = ut1::getTimeSec();
+
+        // Open outfile.
+        int  fd = ::open(filename.c_str(), O_WRONLY, 0666);
+        if (fd < 0)
+        {
+            throw std::runtime_error(std::format("Error opening file '{}' for writing ({})", filename, strerror(errno)));
+        }
+
+        std::vector<uint8_t> buffer(blockSize, pattern);
+
+        for (size_t blockIndex = 0; blockIndex < numBlocks; blockIndex++)
+        {
+            initBlock(buffer, blockIndex, pattern);
+            size_t accessSize = blockSize;
+            if ((blockIndex + 1) * blockSize > sizeBytes)
+            {
+                accessSize = sizeBytes % blockSize;
+            }
+
+            double startTime = ut1::getTimeSec();
+            ssize_t result = write(fd, buffer.data(), accessSize);
+            double elapsed = ut1::getTimeSec() - startTime;
+            if (result < 0)
+            {
+                blockStats[blockIndex].errors++;
+                totalWrite.errors++;
+            }
+            else
+            {
+                blockStats[blockIndex].time += elapsed;
+                blockStats[blockIndex].bytes += accessSize;
+                totalWrite.time += elapsed;
+                totalWrite.bytes += accessSize;
+            }
+            printProgress(blockIndex);
+        }
+
+        close(fd);
+        printPassStats(/*read=*/false);
+        passIndex++;
+    }
+
+    void printProgress(size_t blockIndex)
+    {
+        double now = ut1::getTimeSec();
+        double elapsed = now - lastProgressTime;
+        if (elapsed < 0.5)
+        {
+            return;
+        }
+        double totalBytesOnePass = double(numBlocks) * blockSize;
+        double totalReadBytes = totalBytesOnePass;
+        double totalWriteBytes = 0.0;
+        if (numPasses > 1)
+        {
+            std::cout << (passIndex & 1 ? "read" : "write") << std::format(" pass {}/{} (pat {:02x}): ", passIndex + 1, numPasses, patterns[passIndex]);
+            totalReadBytes = numPasses / 2 * totalBytesOnePass;
+            totalWriteBytes = numPasses / 2 * totalBytesOnePass;
+        }
+
+        double bytes = double(blockIndex) * blockSize;
+        double percent = (passIndex * totalBytesOnePass + bytes) / (totalReadBytes + totalWriteBytes) * 100.0;
+        double remainingSec = 0.0;
+        if (getReadBytesPerSecond() > 0.0)
+        {
+            remainingSec += (totalReadBytes - totalRead.bytes) / getReadBytesPerSecond();
+        }
+        else if (getWriteBytesPerSecond() > 0.0)
+        {
+            // Approximate read speed with write speed for the very first write pass.
+            remainingSec += (totalReadBytes - totalRead.bytes) / getWriteBytesPerSecond();
+        }
+        if (getWriteBytesPerSecond() > 0.0)
+        {
+            remainingSec += (totalWriteBytes - totalWrite.bytes) / getWriteBytesPerSecond();
+        }
+        std::cout << std::format("{:6d}/{:6d} {:.1f}/{:.1f}MB {:4.1f}% remaining={} read={:.1f}MB/s write={:.1f}MB/s   \r",
+            blockIndex, numBlocks, bytes / MB, totalBytesOnePass / MB,
+            percent, ut1::secondsToString(remainingSec),
+            getReadBytesPerSecond() / MB, getWriteBytesPerSecond() / MB) << std::flush;
+        lastProgressTime = now;
+    }
+
+    double getReadBytesPerSecond()
+    {
+        if ((totalRead.time > 0.0) && (totalRead.bytes > 0.0))
+        {
+            return totalRead.bytes / totalRead.time;
+        }
+        return 0.0;
+    }
+
+    double getWriteBytesPerSecond()
+    {
+        if ((totalWrite.time > 0.0) && (totalWrite.bytes > 0.0))
+        {
+            return totalWrite.bytes / totalWrite.time;
+        }
+        return 0.0;
+    }
+
+    void printPassStats(bool read)
+    {
+        std::string readWrite = read ? "read" : "write";
+        // Write outfile.
+        if (!outfile.empty())
+        {
+            std::string outfilename = std::format("{}_{}{}_{}.txt", outfile, readWrite, passIndex, sizeBytes);
+            std::ofstream os(outfilename);
+            if (!os)
+            {
+                throw std::runtime_error(std::format("Error while opening file '{}' for writing!", outfilename));
+            }
+            os << std::dec << std::scientific;
+            for (size_t i = 0; i < numBlocks; i++)
+            {
+                os << i << "," << blockStats[i].time << "," << blockStats[i].errors << "\n";
+            }
+        }
+
+        // Collect stats.
+        std::sort(blockStats.begin(), blockStats.end(), [](const BlockStats& a, const BlockStats& b) { return a.getRateMB() < b.getRateMB(); });
+        double min = blockStats[0].getRateMB();
+        double max = blockStats[numBlocks - 1].getRateMB();
+        double med = blockStats[numBlocks / 2].getRateMB();
+        double totalTime = std::accumulate(blockStats.begin(), blockStats.end(), 0.0, [](auto acc, const auto& r) { return acc + r.time; });
+        size_t errors = std::accumulate(blockStats.begin(), blockStats.end(), 0, [](auto acc, const auto& r) { return acc + r.errors; });
+        double avg = 0.0;
+        if (totalTime > 0.0)
+        {
+            avg = sizeBytes / totalTime / MB;
+        }
+        std::cout << std::format("pass {}/{} ({}): {} errors (min={:.1f}MB/s avg={:.1f}MB/s med={:.1f}MB/s max={:.1f}MB/s)                        \n", passIndex + 1, numPasses, readWrite, errors, min, avg, med, max);
+        std::vector<double> percentiles({50, 20, 10, 5});
+        for (double percent: percentiles)
+        {
+            size_t num = 0;
+            for (; num < numBlocks && blockStats[num].getRateMB() < med * percent / 100.0; num++);
+            if (num)
+            {
+                std::cout << std::format("Warning: Number of blocks slower than {:.0f}% of median: {}\n", percent, num);
+            }
+        }
+    }
+
+    void initBlock(std::vector<uint8_t>& buffer, size_t blockIndex, uint8_t pattern)
+    {
+        buffer[0] = pattern ^ (blockIndex & 0xff);
+        buffer[1] = pattern ^ ((blockIndex >> 8) & 0xff);
+        buffer[2] = pattern ^ ((blockIndex >> 16) & 0xff);
+        buffer[3] = pattern ^ ((blockIndex >> 24) & 0xff);
+        buffer[4] = pattern ^ ((blockIndex >> 32) & 0xff);
+        buffer[5] = pattern ^ ((blockIndex >> 40) & 0xff);
+        buffer[6] = pattern ^ ((blockIndex >> 48) & 0xff);
+        buffer[7] = pattern ^ ((blockIndex >> 56) & 0xff);
+    }
+
+    // Input:
+    std::string filename;
+    std::string outfile;
+    size_t blockSize{};
+    size_t sizeBytes{};
+    size_t numBlocks{};
+    std::vector<uint8_t> patterns;
+
+    // Measurements:
+    struct BlockStats
+    {
+        double time{};
+        size_t errors{};
+        size_t bytes{};
+        double getRateMB() const { if (time > 0.0) return bytes / time / MB; else return 0.0; }
+    };
+    std::vector<BlockStats> blockStats;
+    BlockStats totalWrite;
+    BlockStats totalRead;
+
+    // State:
+    double lastProgressTime{};
+    size_t passIndex{};
+    size_t readPassesRemaining{};
+    size_t writePassesRemaining{};
+    size_t numPasses{};
+};
+
+
+/// Main.
+int main(int argc, char* argv[])
+{
+    // Run unit tests and exit if enabled at compile time.
+    UNIT_TEST_RUN();
+
+    try
+    {
+        // Command line options.
+        ut1::CommandLineParser cl("scanbadblocks", "Check block device by reading all blocks and optionally writing them.\n"
+                                  "\n"
+                                  "Usage: $programName [OPTIONS] BLOCK_DEVICE\n"
+                                  "\n",
+                                  "$programName version $version *** Copyright (c) 2025 Johannes Overmann *** https://github.com/jovermann/scanbadblocks",
+                                  "1.0.3");
+
+        cl.addHeader("\nOptions:\n");
+        cl.addOption('b', "block-size", "Granularity of reads/writes in bytes.", "BLOCKSIZE", "4M");
+        cl.addOption('w', "overwrite", "Overwrite device with known pattern and then read it back. This immediately destroys the contents of the disk, erases the disk and deletes all files on the disk. Specify twice to override interactive safety prompt. The default is just to read the disk.");
+        cl.addOption('p', "pattern", "Comma separated list of one or more hexadecimal byte values for --overwrite. Each byte will result in one write pass and one read pass on the disk. Useful patterns to clear the disk 4 times are 55,aa,00,ff. The default is 00 resulting in one write pass and one read pass.", "PATTERN", "00");
+        cl.addOption('o', "outfile", "Write timing data to CSV files of the format PREFIX_PASS_DISKSIZE.txt. ", "PREFIX", "scanbadblocks");
+        cl.addOption('v', "verbose", "Increase verbosity. Specify multiple times to be more verbose.");
+
+        // Parse command line options.
+        cl.parse(argc, argv);
+        if (cl.getArgs().size() != 1)
+        {
+            cl.error("Missing argument: BLOCK_DEVICE.\n");
+        }
+        std::string filename = argv[1];
+        if (!ut1::fsExists(filename))
+        {
+            cl.error(std::format("File '{}' does not exist!\n", filename));
+        }
+        verbose = cl.getUInt("verbose");
+
+        BlockChecker blockChecker(filename, cl.getStr("block-size"), cl.getStr("pattern"), cl.getStr("outfile"));
+
+        if (cl("overwrite"))
+        {
+            // Write/read mode.
+            if (cl.getCount("overwrite") < 2)
+            {
+                std::cout << "Please enter OVERWRITE and press enter to confirm deleting all data on '" << filename << ":\n";
+                std::string line;
+                std::getline(std::cin, line);
+                if (line != "OVERWRITE")
+                {
+                    std::cout << "Not confirmed. Exiting.\n";
+                    std::exit(0);
+                }
+            }
+            blockChecker.checkWriteRead();
+        }
+        else
+        {
+            // Read-only mode.
+            blockChecker.checkReadOnly();
+        }
+
+        blockChecker.printResult();
+    }
+    catch (const std::exception &e)
+    {
+        ut1::CommandLineParser::reportErrorAndExit(e.what());
+    }
+
+    return 0;
+}
